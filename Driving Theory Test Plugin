@@ -1,0 +1,683 @@
+  <?php
+/**
+ * Plugin Name: Driving Theory Test Plugin
+ * Description: A complete plugin to conduct a driving theory test with a full admin management system. Use the shortcode [driving_theory_test].
+ * Version: 4.8 (Admin Scripts Refactor & Uploader Fix)
+ * Author: Gemini
+ */
+
+if (!defined('ABSPATH')) {
+    exit; // Exit if accessed directly.
+}
+
+define('DTT_PLUGIN_FILE', __FILE__);
+
+// =============================================================================
+// 1. DATABASE SETUP (Activation Hook)
+// =============================================================================
+
+/**
+ * Creates the custom database table on plugin activation.
+ */
+function dtt_activate_plugin() {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'dtt_questions';
+    $charset_collate = $wpdb->get_charset_collate();
+
+    $sql = "CREATE TABLE $table_name (
+        id mediumint(9) NOT NULL AUTO_INCREMENT,
+        category varchar(100) NOT NULL,
+        language varchar(10) NOT NULL,
+        question_text text NOT NULL,
+        question_image_id mediumint(9) DEFAULT 0 NOT NULL,
+        options longtext NOT NULL,
+        correct_answer smallint(5) NOT NULL,
+        PRIMARY KEY  (id)
+    ) $charset_collate;";
+
+    require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+    dbDelta($sql);
+}
+register_activation_hook(DTT_PLUGIN_FILE, 'dtt_activate_plugin');
+
+
+// =============================================================================
+// 2. ADMIN MANAGEMENT SYSTEM
+// =============================================================================
+
+/**
+ * Adds the main menu and sub-menu pages to the WordPress admin.
+ */
+function dtt_admin_menu() {
+    add_menu_page(
+        'Driving Test',
+        'Driving Test',
+        'manage_options',
+        'dtt_questions',
+        'dtt_render_questions_list_page',
+        'dashicons-car',
+        25
+    );
+    add_submenu_page(
+        'dtt_questions',
+        'All Questions',
+        'All Questions',
+        'manage_options',
+        'dtt_questions',
+        'dtt_render_questions_list_page'
+    );
+    add_submenu_page(
+        'dtt_questions',
+        'Add New Question',
+        'Add New',
+        'manage_options',
+        'dtt_add_new',
+        'dtt_render_add_edit_page'
+    );
+}
+add_action('admin_menu', 'dtt_admin_menu');
+
+/**
+ * Enqueues scripts and styles for the admin pages using the standard WordPress hook.
+ * This is the new, corrected method for loading assets.
+ */
+function dtt_admin_enqueue_scripts($hook_suffix) {
+    // Only load assets on our plugin's pages to avoid conflicts.
+    if (strpos($hook_suffix, 'dtt_') === false) {
+        return;
+    }
+
+    // Add CSS for all plugin admin pages using the recommended inline method.
+    $css = "
+        .dtt-form-table th { padding-top: 25px; vertical-align: top; }
+        .dtt-form-table input[type='text'], .dtt-form-table textarea, .dtt-form-table select { width: 100%;  }
+        #options-wrapper .option-row { display: flex; align-items: center; margin-bottom: 15px; background: #f9f9f9; padding: 10px; border: 1px solid #ddd; border-radius: 4px; }
+        #options-wrapper .option-row input[type='text'] { flex-grow: 1; margin-right: 10px; }
+        #options-wrapper .option-row .dtt-image-preview { width: 50px; height: 50px; background: #eee; border: 1px solid #ccc; margin-right: 10px; background-size: contain; background-repeat: no-repeat; background-position: center; }
+        .dtt_upload_image_button, .dtt_remove_image_button { margin-right: 5px !important; }
+        .dtt-image-controls { display: flex; flex-direction: column; align-items: center; margin-right: 10px; }
+        .dtt-form-table .description { font-weight: normal; font-style: italic; }
+    ";
+    wp_register_style('dtt-admin-inline-css', false);
+    wp_enqueue_style('dtt-admin-inline-css');
+    wp_add_inline_style('dtt-admin-inline-css', $css);
+
+    // Specifically load media uploader JS ONLY on the "Add/Edit" page.
+    if ($hook_suffix === 'driving-test_page_dtt_add_new') {
+        // This is the crucial function that enables the wp.media object.
+        wp_enqueue_media();
+
+        // The JavaScript for handling the media uploader and dynamic options.
+        // Using wp_add_inline_script is the safest way to add this.
+        $js_code = "
+        jQuery(document).ready(function($) {
+            // --- Logic for dynamic options ---
+            $('#add-option-btn').on('click', function() {
+                var optionIndex = $('#options-wrapper .option-row').length;
+                var newOptionRow = `
+                    <div class='option-row'>
+                        <input type='radio' name='correct_answer' value='${optionIndex}' required>
+                        <input type='text' name='options[${optionIndex}][text]' placeholder='Option text' required />
+                        <div class='dtt-image-controls'>
+                            <div class='dtt-image-preview' id='preview-option-${optionIndex}'></div>
+                            <input type='hidden' name='options[${optionIndex}][image_id]' id='option-image-id-${optionIndex}' value='0'>
+                            <button type='button' class='button dtt_upload_image_button' data-target-id='option-image-id-${optionIndex}' data-preview-id='preview-option-${optionIndex}'>Image</button>
+                            <a href='#' class='dtt_remove_image_button'>Remove</a>
+                        </div>
+                        <button type='button' class='button remove-option-btn'>&times;</button>
+                    </div>`;
+                $('#options-wrapper').append(newOptionRow);
+            });
+
+            $('#options-wrapper').on('click', '.remove-option-btn', function() {
+                $(this).closest('.option-row').remove();
+                $('#options-wrapper .option-row').each(function(index) {
+                    $(this).find('input[type=\"radio\"]').val(index);
+                });
+            });
+
+            // --- Media Uploader Logic ---
+            $('body').on('click', '.dtt_upload_image_button', function(e) {
+                e.preventDefault();
+                var button = $(this);
+                var targetInput = $('#' + button.data('target-id'));
+                var previewDiv = $('#' + button.data('preview-id'));
+                var frame = wp.media({
+                    title: 'Select or Upload Image',
+                    button: { text: 'Use this image' },
+                    multiple: false
+                });
+                frame.on('select', function() {
+                    var attachment = frame.state().get('selection').first().toJSON();
+                    previewDiv.css('background-image', 'url(' + attachment.url + ')');
+                    targetInput.val(attachment.id);
+                });
+                frame.open();
+            });
+
+            // --- Logic for removing an image ---
+            $('body').on('click', '.dtt_remove_image_button', function(e) {
+                e.preventDefault();
+                var controls = $(this).closest('.dtt-image-controls');
+                controls.find('.dtt-image-preview').css('background-image', '');
+                controls.find('input[type=\"hidden\"]').val('0');
+            });
+        });
+        ";
+        wp_add_inline_script('jquery-core', $js_code);
+    }
+}
+add_action('admin_enqueue_scripts', 'dtt_admin_enqueue_scripts');
+
+/**
+ * Renders the Add/Edit Question form page.
+ */
+function dtt_render_add_edit_page() {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'dtt_questions';
+
+    // --- Save/Update Logic ---
+    if (isset($_POST['dtt_save_question_nonce']) && wp_verify_nonce($_POST['dtt_save_question_nonce'], 'dtt_save_question')) {
+        $question_id = isset($_POST['question_id']) ? intval($_POST['question_id']) : 0;
+        
+        $sanitized_options = [];
+        if (isset($_POST['options']) && is_array($_POST['options'])) {
+            foreach ($_POST['options'] as $index => $option) {
+                $sanitized_options[$index] = [
+                    'text' => sanitize_text_field($option['text']),
+                    'image_id' => intval($option['image_id'])
+                ];
+            }
+        }
+
+        $data = [
+            'category' => sanitize_text_field($_POST['category']),
+            'language' => sanitize_text_field($_POST['language']),
+            'question_text' => wp_kses_post($_POST['question_text']),
+            'question_image_id' => intval($_POST['question_image_id']),
+            'options' => serialize($sanitized_options),
+            'correct_answer' => intval($_POST['correct_answer'])
+        ];
+
+        if ($question_id > 0) {
+            $wpdb->update($table_name, $data, ['id' => $question_id]);
+        } else {
+            $wpdb->insert($table_name, $data);
+        }
+        echo '<script>window.location.href="?page=dtt_questions&message=1";</script>';
+        exit;
+    }
+    
+    // --- Form Rendering Logic ---
+    $item = null;
+    if (isset($_GET['action']) && $_GET['action'] == 'edit' && isset($_GET['id'])) {
+        $item = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table_name WHERE id = %d", intval($_GET['id'])));
+        if($item) $item->options = unserialize($item->options);
+    }
+    
+    $question_image_url = $item && $item->question_image_id ? wp_get_attachment_url($item->question_image_id) : '';
+
+    ?>
+    <div class="wrap">
+        <h1><?php echo $item ? 'Edit Question' : 'Add New Question'; ?></h1>
+        <p>Questions added here will be available in all relevant test categories on the website based on the selected language.</p>
+
+        <form method="POST">
+            <input type="hidden" name="question_id" value="<?php echo $item ? $item->id : 0; ?>">
+            <?php wp_nonce_field('dtt_save_question', 'dtt_save_question_nonce'); ?>
+            
+            <table class="form-table dtt-form-table">
+                 <tr>
+                    <th>Language <p class="description">Select the language of the question and answers.</p></th>
+                    <td>
+                        <select name="language" required>
+                            <option value="ur" <?php selected($item ? $item->language : 'ur', 'ur'); ?>>Urdu</option>
+                            <option value="en" <?php selected($item ? $item->language : '', 'en'); ?>>English</option>
+                        </select>
+                         <p class="description">"Urdu" questions will appear in all main tests. "English" questions will only appear in the "Test in English".</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th>Primary Category <p class="description">For organizational purposes only.</p></th>
+                    <td>
+                        <select name="category" required>
+                            <option value="general" <?php selected($item ? $item->category : '', 'general'); ?>>General</option>
+                            <option value="motorcycle" <?php selected($item ? $item->category : '', 'motorcycle'); ?>>Motorcycle</option>
+                            <option value="car" <?php selected($item ? $item->category : '', 'car'); ?>>Car</option>
+                            <option value="ltv_htv" <?php selected($item ? $item->category : '', 'ltv_htv'); ?>>LTV/HTV/PSV</option>
+                        </select>
+                    </td>
+                </tr>
+                <tr>
+                    <th>Question Text</th>
+                    <td><textarea name="question_text" rows="4" required><?php echo $item ? esc_textarea($item->question_text) : ''; ?></textarea></td>
+                </tr>
+                <tr>
+                    <th>Question Image (Optional)</th>
+                    <td>
+                        <div class="dtt-image-controls">
+                            <div class="dtt-image-preview" id="preview-question" style="width:100px; height:100px; background-image: url('<?php echo esc_url($question_image_url); ?>');"></div>
+                            <input type="hidden" name="question_image_id" id="question-image-id" value="<?php echo $item ? $item->question_image_id : '0'; ?>">
+                            <button type="button" class="button dtt_upload_image_button" data-target-id="question-image-id" data-preview-id="preview-question">Upload Image</button>
+                            <a href="#" class="dtt_remove_image_button">Remove Image</a>
+                        </div>
+                    </td>
+                </tr>
+                <tr>
+                    <th>Options <p class="description">Select the correct answer using the radio button. Add images if needed.</p></th>
+                    <td>
+                        <div id="options-wrapper">
+                            <?php 
+                            $options = $item ? $item->options : [];
+                            if (!empty($options)) :
+                                foreach ($options as $index => $option) :
+                                    $option_text = isset($option['text']) ? $option['text'] : '';
+                                    $option_image_id = isset($option['image_id']) ? $option['image_id'] : 0;
+                                    $option_image_url = $option_image_id ? wp_get_attachment_url($option_image_id) : '';
+                            ?>
+                            <div class="option-row">
+                                <input type="radio" name="correct_answer" value="<?php echo $index; ?>" <?php checked($item->correct_answer, $index); ?> required>
+                                <input type="text" name="options[<?php echo $index; ?>][text]" placeholder="Option text" value="<?php echo esc_attr($option_text); ?>" required />
+                                <div class="dtt-image-controls">
+                                    <div class="dtt-image-preview" id="preview-option-<?php echo $index; ?>" style="background-image: url('<?php echo esc_url($option_image_url); ?>');"></div>
+                                    <input type="hidden" name="options[<?php echo $index; ?>][image_id]" id="option-image-id-<?php echo $index; ?>" value="<?php echo esc_attr($option_image_id); ?>">
+                                    <button type="button" class="button dtt_upload_image_button" data-target-id="option-image-id-<?php echo $index; ?>" data-preview-id="preview-option-<?php echo $index; ?>">Image</button>
+                                    <a href="#" class="dtt_remove_image_button">Remove</a>
+                                </div>
+                                <button type="button" class="button remove-option-btn">&times;</button>
+                            </div>
+                            <?php endforeach; else: ?>
+                                <?php for($i=0; $i<2; $i++): ?>
+                                <div class="option-row">
+                                    <input type="radio" name="correct_answer" value="<?php echo $i; ?>" required <?php if($i==0) echo 'checked'; ?>>
+                                    <input type="text" name="options[<?php echo $i; ?>][text]" placeholder="Option text" required />
+                                    <div class="dtt-image-controls">
+                                        <div class="dtt-image-preview" id="preview-option-<?php echo $i; ?>"></div>
+                                        <input type="hidden" name="options[<?php echo $i; ?>][image_id]" id="option-image-id-<?php echo $i; ?>" value="0">
+                                        <button type="button" class="button dtt_upload_image_button" data-target-id="option-image-id-<?php echo $i; ?>" data-preview-id="preview-option-<?php echo $i; ?>">Image</button>
+                                        <a href="#" class="dtt_remove_image_button">Remove</a>
+                                    </div>
+                                    <button type="button" class="button remove-option-btn">&times;</button>
+                                </div>
+                                <?php endfor; ?>
+                            <?php endif; ?>
+                        </div>
+                        <button type="button" id="add-option-btn" class="button">Add Another Option</button>
+                    </td>
+                </tr>
+            </table>
+            <?php submit_button($item ? 'Update Question' : 'Save Question'); ?>
+        </form>
+    </div>
+    <?php
+}
+
+/**
+ * Renders the "All Questions" list page.
+ */
+function dtt_render_questions_list_page() {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'dtt_questions';
+
+    // === HANDLE DELETE ACTIONS ===
+    // Handle deleting ALL questions
+    if (isset($_POST['dtt_action']) && $_POST['dtt_action'] == 'delete_all' && isset($_POST['dtt_delete_all_nonce'])) {
+        if (wp_verify_nonce($_POST['dtt_delete_all_nonce'], 'dtt_delete_all_questions')) {
+            $wpdb->query("TRUNCATE TABLE $table_name");
+            echo '<script>window.location.href="?page=dtt_questions&message=3";</script>';
+            exit;
+        }
+    }
+
+    // Handle deleting a SINGLE question
+    if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['id']) && isset($_GET['_wpnonce'])) {
+        if (wp_verify_nonce($_GET['_wpnonce'], 'dtt_delete_question_' . $_GET['id'])) {
+            $wpdb->delete($table_name, ['id' => intval($_GET['id'])]);
+            echo '<script>window.location.href="?page=dtt_questions&message=2";</script>';
+            exit;
+        }
+    }
+    
+    $questions = $wpdb->get_results("SELECT id, question_text, category, language FROM $table_name ORDER BY id DESC");
+    ?>
+    <div class="wrap">
+        <h1 class="wp-heading-inline">All Questions</h1>
+        <a href="?page=dtt_add_new" class="page-title-action">Add New</a>
+        
+        <form method="post" onsubmit="return confirm('⚠️ Are you absolutely sure you want to delete ALL questions? This action cannot be undone.');" style="display: inline-block; margin-left: 10px; vertical-align: middle;">
+            <input type="hidden" name="dtt_action" value="delete_all">
+            <?php wp_nonce_field('dtt_delete_all_questions', 'dtt_delete_all_nonce'); ?>
+            <button type="submit" class="button" style="background-color: #dc3232; color: white; border-color: #a02121;">Delete All Questions</button>
+        </form>
+        
+        <?php if (isset($_GET['message'])): ?>
+            <div class="notice notice-success is-dismissible" style="margin-top: 20px;"><p>
+                <?php
+                switch ($_GET['message']) {
+                    case 1:
+                        echo 'Question saved successfully.';
+                        break;
+                    case 2:
+                        echo 'Question deleted successfully.';
+                        break;
+                    case 3:
+                        echo '<strong>All questions have been deleted successfully.</strong>';
+                        break;
+                }
+                ?>
+            </p></div>
+        <?php endif; ?>
+
+        <table class="wp-list-table widefat fixed striped" style="margin-top: 20px;">
+            <thead>
+                <tr>
+                    <th style="width: 50%;">Question</th>
+                    <th>Primary Category</th>
+                    <th>Language</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php if ($questions): foreach ($questions as $q): ?>
+                <tr>
+                    <td>
+                        <strong><?php echo esc_html(wp_strip_all_tags($q->question_text)); ?></strong>
+                        <div class="row-actions">
+                            <span class="edit"><a href="?page=dtt_add_new&action=edit&id=<?php echo $q->id; ?>">Edit</a> | </span>
+                            <span class="trash"><a href="?page=dtt_questions&action=delete&id=<?php echo $q->id; ?>&_wpnonce=<?php echo wp_create_nonce('dtt_delete_question_' . $q->id); ?>" onclick="return confirm('Are you sure you want to delete this question?');" class="submitdelete">Delete</a></span>
+                        </div>
+                    </td>
+                    <td><?php echo esc_html(ucfirst(str_replace('_', ' ', $q->category))); ?></td>
+                    <td><?php echo esc_html(strtoupper($q->language)); ?></td>
+                </tr>
+                <?php endforeach; else: ?>
+                <tr><td colspan="3">No questions found.</td></tr>
+                <?php endif; ?>
+            </tbody>
+        </table>
+    </div>
+    <?php
+}
+
+
+// =============================================================================
+// 3. FRONTEND QUIZ DISPLAY (Shortcode)
+// =============================================================================
+
+function dtt_frontend_shortcode() {
+    // Enqueue scripts and styles for the frontend
+    wp_enqueue_style('font-awesome-5', 'https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css');
+    wp_register_script('dtt-quiz-js', plugins_url('/public/js/quiz.js', DTT_PLUGIN_FILE), [], false, true);
+
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'dtt_questions';
+    $results = $wpdb->get_results("SELECT * FROM $table_name", ARRAY_A);
+    
+    $questions_ur = [];
+    $questions_en = [];
+
+    foreach ($results as $q) {
+        $options = unserialize($q['options']);
+        if (!is_array($options)) continue;
+
+        $final_options = [];
+        foreach($options as $opt) {
+            $final_options[] = [
+                'text' => isset($opt['text']) ? $opt['text'] : '',
+                'image' => !empty($opt['image_id']) ? wp_get_attachment_url($opt['image_id']) : null
+            ];
+        }
+
+        $correct_answer_index = $q['correct_answer'];
+        $correct_answer_text = isset($options[$correct_answer_index]['text']) ? $options[$correct_answer_index]['text'] : '';
+        
+        $question_data = [
+            'question' => $q['question_text'],
+            'image' => !empty($q['question_image_id']) ? wp_get_attachment_url($q['question_image_id']) : null,
+            'options' => $final_options,
+            'answer' => $correct_answer_text,
+            'lang' => $q['language']
+        ];
+
+        if ($q['language'] === 'ur') {
+            $questions_ur[] = $question_data;
+        } else {
+            $questions_en[] = $question_data;
+        }
+    }
+    
+    wp_localize_script('dtt-quiz-js', 'dtt_quiz_data', [
+        'questions_ur' => $questions_ur,
+        'questions_en' => $questions_en,
+    ]);
+
+    wp_enqueue_script('dtt-quiz-js');
+    
+    ob_start();
+    ?>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Nastaliq+Urdu:wght@400;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
+        .driving-test-container{font-family:'Roboto',sans-serif;background-color:#ffffff;padding:20px 30px;border-radius:15px;box-shadow:0 8px 25px rgba(0,0,0,0.1);margin:30px auto;text-align:center;border:1px solid #e0e0e0;}.driving-test-container.urdu-test{font-family:'Noto Nastaliq Urdu',serif;direction:rtl}#test-selection-screen h2,#quiz-screen h3,#result-screen h3{color:#2c3e50;font-weight:700;margin-bottom:30px}#test-categories{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:25px}.quiz-category-card{text-decoration:none;color:#34495e;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px 10px;transition:all 0.3s ease;border:1px solid #ddd;border-radius:10px}.quiz-category-card .quiz-icon-wrapper{width:80px;height:80px;border-radius:50%;border:2px solid #0073aa;display:flex;align-items:center;justify-content:center;margin-bottom:15px;transition:all 0.3s ease;background-color:#fff}.quiz-category-card .quiz-icon-wrapper i{font-size:36px;color:#0073aa;transition:all 0.3s ease}.quiz-category-card .quiz-title{font-size:16px;font-weight:500;margin:0;color:#2c3e50}.quiz-category-card:hover{border-color:#0073aa;transform:translateY(-5px)}.quiz-category-card:hover .quiz-icon-wrapper{background-color:#0073aa;border-color:#005a87;}.quiz-category-card:hover .quiz-icon-wrapper i{color:#ffffff}#quiz-screen,#result-screen{display:none}#question-container{background:#f9fafb;padding:25px;border-radius:10px;margin-bottom:20px;text-align:inherit;border:1px solid #e5e7eb}#question-image{max-width:200px;max-height:200px;margin:15px auto;display:block;border-radius:8px;border:1px solid #ccc}#question-text{font-size:1.3rem;line-height:1.6;color:#1f2937;margin-bottom:20px}#options-container{display:grid;grid-template-columns:1fr;gap:10px}.option{display:flex;align-items:center;gap:15px;background-color:#fff;color:#374151;padding:15px;margin:0;border-radius:8px;cursor:pointer;transition:all 0.3s ease;text-align:inherit;border:2px solid #e5e7eb}.option-image{width:50px;height:50px;border-radius:4px;object-fit:cover;border:1px solid #ddd}.option:hover{background-color:#f3f4f6;border-color:#9ca3af}.option.selected{background-color:#3b82f6;color:white;border-color:#2563eb}.option.correct{background-color:#22c55e !important;color:white !important;border-color:#16a34a !important;transform:scale(1.02)}.option.incorrect{background-color:#ef4444 !important;color:white !important;border-color:#dc2626 !important}.option.disabled{pointer-events:none}#progress-container{width:100%;background-color:#e5e7eb;border-radius:10px;margin:20px 0;overflow:hidden}#progress-bar{width:0%;height:18px;background:linear-gradient(90deg,#22c55e,#16a34a);border-radius:10px;transition:width 0.4s ease-in-out}#submit-btn,#restart-quiz-btn,#home-btn{color:white;border:none;padding:12px 30px;border-radius:8px;cursor:pointer;font-size:16px;font-weight:bold;transition:all 0.3s ease;margin:10px 5px 5px}#submit-btn,#restart-quiz-btn{background:#16a34a}#submit-btn:hover,#restart-quiz-btn:hover{background:#15803d}#home-btn{background:#3b82f6}#home-btn:hover{background:#2563eb}#submit-btn:disabled{background:#9ca3af;cursor:not-allowed}#result-screen #grade-letter{font-size:5rem;font-weight:bold;margin-bottom:0}#feedback-text{font-size:1.3em;font-weight:500;margin-top:5px;margin-bottom:20px}#score-text{font-size:1.1em;margin-bottom:20px}
+    </style>
+    
+    <div id="driving-test-container" class="driving-test-container">
+        <div id="test-selection-screen">
+            <h2>Motorcycle, Car/Jeep, LTV, HTV, PSV Tests</h2>
+            <div id="test-categories">
+                 <a href="#" class="quiz-category-card" data-category="car" data-lang="ur">
+                    <span class="quiz-icon-wrapper"><i class="fas fa-car"></i></span>
+                    <h3 class="quiz-title">Car Test</h3>
+                </a>
+                <a href="#" class="quiz-category-card" data-category="motorcycle" data-lang="ur">
+                    <span class="quiz-icon-wrapper"><i class="fas fa-motorcycle"></i></span>
+                    <h3 class="quiz-title">Motorcycle Test</h3>
+                </a>
+                <a href="#" class="quiz-category-card" data-category="ltv_htv" data-lang="ur">
+                    <span class="quiz-icon-wrapper"><i class="fas fa-truck"></i></span>
+                    <h3 class="quiz-title">LTV/HTV/PSV Test</h3>
+                </a>
+                <a href="#" class="quiz-category-card" data-category="english_test" data-lang="en">
+                    <span class="quiz-icon-wrapper"><i class="fas fa-globe-americas"></i></span>
+                    <h3 class="quiz-title">Test in English</h3>
+                </a>
+            </div>
+        </div>
+
+        <div id="quiz-screen">
+            <h3 id="quiz-title"></h3>
+            <div id="progress-container"><div id="progress-bar"></div></div>
+            <p id="question-count"></p>
+            <div id="question-container">
+                <img id="question-image" src="" alt="Question Image" style="display:none;">
+                <p id="question-text"></p>
+                <div id="options-container"></div>
+            </div>
+            <button id="submit-btn" disabled>Next Question</button>
+        </div>
+
+        <div id="result-screen">
+            <h3>Test Complete!</h3>
+            <h2 id="grade-letter"></h2>
+            <p id="feedback-text"></p>
+            <p id="score-text"></p>
+            <button id="restart-quiz-btn">Restart Quiz</button>
+            <button id="home-btn">Choose Another Test</button>
+        </div>
+    </div>
+
+    <script id="dtt-quiz-js-logic">
+    document.addEventListener('DOMContentLoaded', function() {
+        const questionPools = {
+            ur: dtt_quiz_data.questions_ur || [],
+            en: dtt_quiz_data.questions_en || []
+        };
+        let currentQuestions = [];
+        let currentQuestionIndex = 0;
+        let score = 0;
+        const totalQuestionsPerTest = 25;
+        let lastCategory, lastTitle, lastLang;
+
+        const container = document.getElementById('driving-test-container');
+        const selectionScreen = document.getElementById('test-selection-screen');
+        const quizScreen = document.getElementById('quiz-screen');
+        const resultScreen = document.getElementById('result-screen');
+        const quizTitleEl = document.getElementById('quiz-title');
+        const questionCountEl = document.getElementById('question-count');
+        const questionTextEl = document.getElementById('question-text');
+        const questionImageEl = document.getElementById('question-image');
+        const optionsContainerEl = document.getElementById('options-container');
+        const submitBtn = document.getElementById('submit-btn');
+        const progressBar = document.getElementById('progress-bar');
+        const gradeLetterEl = document.getElementById('grade-letter');
+        const scoreTextEl = document.getElementById('score-text');
+        const feedbackTextEl = document.getElementById('feedback-text');
+        const restartQuizBtn = document.getElementById('restart-quiz-btn');
+        const homeBtn = document.getElementById('home-btn');
+
+        document.querySelectorAll('.quiz-category-card').forEach(button => {
+            button.addEventListener('click', function(e) {
+                e.preventDefault();
+                const category = this.getAttribute('data-category');
+                const lang = this.getAttribute('data-lang');
+                const title = this.querySelector('.quiz-title').textContent;
+                startTest(category, title, lang);
+            });
+        });
+
+        function shuffleArray(array) {
+            for (let i = array.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [array[i], array[j]] = [array[j], array[i]];
+            }
+            return array;
+        }
+
+        function startTest(category, title, lang) {
+            lastCategory = category;
+            lastTitle = title;
+            lastLang = lang;
+            const availableQuestions = questionPools[lang];
+            if (availableQuestions.length === 0) {
+                alert('No questions available for this language yet. Please add some in the admin dashboard.');
+                return;
+            }
+            currentQuestions = shuffleArray([...availableQuestions]).slice(0, Math.min(totalQuestionsPerTest, availableQuestions.length));
+            container.className = 'driving-test-container';
+            if (lang === 'ur') {
+                container.classList.add('urdu-test');
+            }
+            currentQuestionIndex = 0;
+            score = 0;
+            selectionScreen.style.display = 'none';
+            resultScreen.style.display = 'none';
+            quizScreen.style.display = 'block';
+            quizTitleEl.textContent = title;
+            submitBtn.textContent = lang === 'ur' ? 'اگلا سوال' : 'Next Question';
+            loadQuestion();
+        }
+
+        function loadQuestion() {
+            if (currentQuestionIndex < currentQuestions.length) {
+                updateProgress();
+                const question = currentQuestions[currentQuestionIndex];
+                const lang = question.lang;
+                questionCountEl.textContent = lang === 'ur' ? `سوال ${currentQuestionIndex + 1} از ${currentQuestions.length}` : `Question ${currentQuestionIndex + 1} of ${currentQuestions.length}`;
+                questionTextEl.innerHTML = question.question;
+                if (question.image) {
+                    questionImageEl.src = question.image;
+                    questionImageEl.style.display = 'block';
+                } else {
+                    questionImageEl.style.display = 'none';
+                }
+                optionsContainerEl.innerHTML = '';
+                shuffleArray(question.options).forEach(option => {
+                    const optionDiv = document.createElement('div');
+                    optionDiv.className = 'option';
+                    optionDiv.dataset.text = option.text;
+                    let innerHTML = `<span>${option.text}</span>`;
+                    if(option.image) {
+                        innerHTML = `<img src="${option.image}" alt="" class="option-image">` + innerHTML;
+                    }
+                    optionDiv.innerHTML = innerHTML;
+                    optionDiv.addEventListener('click', () => {
+                        if (!optionDiv.classList.contains('disabled')) {
+                            selectOption(optionDiv, question.answer);
+                        }
+                    });
+                    optionsContainerEl.appendChild(optionDiv);
+                });
+                submitBtn.disabled = true;
+            } else {
+                showResult();
+            }
+        }
+
+        function selectOption(selectedDiv, correctAnswer) {
+            submitBtn.disabled = false;
+            const isCorrect = selectedDiv.dataset.text === correctAnswer;
+            if (isCorrect) {
+                score++;
+                selectedDiv.classList.add('correct');
+            } else {
+                selectedDiv.classList.add('incorrect');
+                document.querySelectorAll('.option').forEach(opt => {
+                    if (opt.dataset.text === correctAnswer) {
+                        opt.classList.add('correct');
+                    }
+                });
+            }
+            document.querySelectorAll('.option').forEach(opt => opt.classList.add('disabled'));
+        }
+
+        function updateProgress() {
+            progressBar.style.width = ((currentQuestionIndex) / currentQuestions.length) * 100 + '%';
+        }
+
+        function showResult() {
+            progressBar.style.width = '100%';
+            quizScreen.style.display = 'none';
+            resultScreen.style.display = 'block';
+            const lang = lastLang;
+            const percentage = currentQuestions.length > 0 ? (score / currentQuestions.length) * 100 : 0;
+            let grade, feedback, feedbackColor;
+
+            if (percentage >= 90) {
+                grade = 'A';
+                feedback = { en: 'Excellent!', ur: 'بہترین!' };
+                feedbackColor = '#16a34a';
+            } else if (percentage >= 80) {
+                grade = 'B';
+                feedback = { en: 'Good!', ur: 'اچھا!' };
+                feedbackColor = '#16a34a';
+            } else if (percentage >= 70) {
+                grade = 'C';
+                feedback = { en: 'Fair - You Passed!', ur: 'مناسب - آپ کامیاب ہوگئے!' };
+                feedbackColor = '#0073aa';
+            } else {
+                grade = 'F';
+                feedback = { en: 'Needs Improvement - Failed', ur: 'بہتری کی ضرورت ہے - فیل' };
+                feedbackColor = '#ef4444';
+            }
+            gradeLetterEl.textContent = grade;
+            gradeLetterEl.style.color = feedbackColor;
+            feedbackTextEl.textContent = feedback[lang];
+            feedbackTextEl.style.color = feedbackColor;
+            scoreTextEl.textContent = lang === 'ur' ? `آپ کا سکور: ${score} از ${currentQuestions.length}` : `Your Score: ${score} out of ${currentQuestions.length}`;
+            restartQuizBtn.textContent = lang === 'ur' ? 'دوبارہ کوئز شروع کریں' : 'Restart Quiz';
+            homeBtn.textContent = lang === 'ur' ? 'دوسرا ٹیسٹ منتخب کریں' : 'Choose Another Test';
+        }
+
+        submitBtn.addEventListener('click', () => { currentQuestionIndex++; loadQuestion(); });
+        restartQuizBtn.addEventListener('click', () => startTest(lastCategory, lastTitle, lastLang));
+        homeBtn.addEventListener('click', () => {
+            resultScreen.style.display = 'none';
+            selectionScreen.style.display = 'block';
+            progressBar.style.width = '0%';
+            container.className = 'driving-test-container';
+        });
+    });
+    </script>
+    <?php
+    return ob_get_clean();
+}
+add_shortcode('driving_theory_test', 'dtt_frontend_shortcode');
